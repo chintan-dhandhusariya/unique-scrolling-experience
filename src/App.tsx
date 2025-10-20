@@ -1,11 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { sections } from './content';
 import { AnimationPhase, SectionLayout } from './types';
-import { INACTIVITY_TIMEOUT, ANIMATION_DURATION, ZOOM_OUT_SCALE, UI_LAYOUT } from './constants';
+import { INACTIVITY_TIMEOUT, ANIMATION_DURATION, ZOOM_OUT_SCALE, UI_LAYOUT, MOBILE_ZOOM_OUT_SCALE } from './constants';
 import { getViewportCenter, easeOutCubic, easeInOutCubic, clampScroll } from './utils';
 
 function App() {
-  // State
   const [uiVisibility, setUiVisibility] = useState({
     sidebar: false,
     scrollbar: false,
@@ -15,24 +14,32 @@ function App() {
   const [sectionHeightPercentages, setSectionHeightPercentages] = useState<Record<string, number>>({});
   const [sectionLayouts, setSectionLayouts] = useState<SectionLayout[]>([]);
   const [animationPhase, setAnimationPhase] = useState<AnimationPhase>('idle');
-  const [scrollState, setScrollState] = useState({
-    virtual: 0,
-    animated: 0,
-  });
-  const [zoomState, setZoomState] = useState({
-    level: 1,
-    pivotY: 0,
-  });
+  const [scrollState, setScrollState] = useState({ virtual: 0, animated: 0 });
+  const [zoomState, setZoomState] = useState({ level: 1, pivotY: 0 });
+  const [isMobile, setIsMobile] = useState(false);
+  const [mobileZoomedOut, setMobileZoomedOut] = useState(false);
 
-  // Refs
-  const timeouts = useRef({
-    sidebar: null as number | null,
-    scrollbar: null as number | null,
-  });
+  const timeouts = useRef({ sidebar: null as number | null, scrollbar: null as number | null });
   const contentRef = useRef<HTMLDivElement>(null);
   const isAnimating = useRef(false);
   const scrollFillAnimationId = useRef<number | null>(null);
-  
+  const touchStartY = useRef<number | null>(null);
+  const lastTouchY = useRef<number | null>(null);
+
+  useEffect(() => {
+    const checkMobile = () => {
+      const mediaQuery = window.matchMedia('(max-width: 768px)');
+      setIsMobile(mediaQuery.matches);
+    };
+
+    checkMobile();
+    const mediaQuery = window.matchMedia('(max-width: 768px)');
+    const handleMediaChange = (e: MediaQueryListEvent) => setIsMobile(e.matches);
+    
+    mediaQuery.addEventListener('change', handleMediaChange);
+    return () => mediaQuery.removeEventListener('change', handleMediaChange);
+  }, []);
+
   const calculateSectionHeightPercentages = (): Record<string, number> => {
     const heights: Record<string, number> = {};
     let totalHeight = 0;
@@ -70,11 +77,14 @@ function App() {
     return layout?.start ?? document.getElementById(sectionId)?.offsetTop ?? 0;
   };
 
-  
-  const calculateScrollProgress = (scrollY: number): {
-    fills: Record<string, number>;
-    activeId: string;
-  } => {
+  const getMaxScroll = () => {
+    if (!sectionLayouts.length) return 0;
+    const lastSection = sectionLayouts[sectionLayouts.length - 1];
+    const documentHeight = lastSection.end;
+    return Math.max(0, documentHeight - window.innerHeight);
+  };
+
+  const calculateScrollProgress = (scrollY: number): { fills: Record<string, number>; activeId: string } => {
     if (!sectionLayouts.length) {
       return { fills: {}, activeId: sections[0].id };
     }
@@ -109,10 +119,9 @@ function App() {
     if (centerY <= layout.start) return 0;
     if (centerY >= layout.end) return 100;
 
-    const maxScroll = (contentRef.current?.scrollHeight || 0) - window.innerHeight;
+    const maxScroll = getMaxScroll();
     const totalDocHeight = sectionLayouts[sectionLayouts.length - 1]?.end || 1;
 
-    // Special case: ensure last section reaches 100%
     if (
       sectionId === sections[sections.length - 1].id &&
       (centerY >= totalDocHeight - 50 || scrollState.virtual >= maxScroll - 10)
@@ -124,11 +133,7 @@ function App() {
     return Math.max(0, Math.min(100, sectionProgress * 100));
   };
 
-  
-  const createVisibilityHandler = (
-    key: 'sidebar' | 'scrollbar',
-    timeoutDuration = INACTIVITY_TIMEOUT
-  ) => {
+  const createVisibilityHandler = (key: 'sidebar' | 'scrollbar', timeoutDuration = INACTIVITY_TIMEOUT) => {
     return () => {
       setUiVisibility((prev) => ({ ...prev, [key]: true }));
 
@@ -195,7 +200,6 @@ function App() {
       const elapsed = timestamp - phaseStartTime;
 
       if (phase === 1) {
-        // Phase 1: Zoom Out
         const progress = Math.min(1, elapsed / ANIMATION_DURATION.ZOOM_OUT);
         setZoomState((prev) => ({
           ...prev,
@@ -208,7 +212,6 @@ function App() {
           setAnimationPhase('scrolling');
         }
       } else if (phase === 2) {
-        // Phase 2: Scroll while zoomed out
         const progress = Math.min(1, elapsed / ANIMATION_DURATION.SCROLL);
         const easedProgress = easeInOutCubic(progress);
         const compressedDistance = (targetY - startY) * ZOOM_OUT_SCALE;
@@ -224,7 +227,6 @@ function App() {
           setAnimationPhase('zoomIn');
         }
       } else if (phase === 3) {
-        // Phase 3: Zoom In
         const progress = Math.min(1, elapsed / ANIMATION_DURATION.ZOOM_IN);
         const compressedDistance = (targetY - startY) * ZOOM_OUT_SCALE;
         const remainingDistance = targetY - startY - compressedDistance;
@@ -251,32 +253,143 @@ function App() {
     requestAnimationFrame(animate);
   };
 
-  const handleScrollbarClick = (clickY: number, scrollbarHeight: number) => {
-    let accumulatedHeight = 0;
-    let clickedSection = null;
-    let clickYWithinSection = clickY;
+  const performMobileZoomOut = () => {
+    if (isAnimating.current) return;
 
-    for (const section of sections) {
-      const segmentHeight = (sectionHeightPercentages[section.id] || 0) * scrollbarHeight / 100;
-      if (clickY >= accumulatedHeight && clickY < accumulatedHeight + segmentHeight) {
-        clickedSection = section;
-        clickYWithinSection = clickY - accumulatedHeight;
-        break;
+    isAnimating.current = true;
+    setAnimationPhase('zoomOut');
+
+    const centerY = getViewportCenter(scrollState.virtual);
+    setZoomState({ level: 1, pivotY: centerY });
+
+    let startTime: number | null = null;
+
+    const animate = (timestamp: number) => {
+      if (!startTime) startTime = timestamp;
+      const elapsed = timestamp - startTime;
+      const progress = Math.min(1, elapsed / ANIMATION_DURATION.ZOOM_OUT);
+
+      setZoomState((prev) => ({
+        ...prev,
+        level: 1 - (1 - MOBILE_ZOOM_OUT_SCALE) * progress,
+      }));
+
+      if (progress === 1) {
+        setAnimationPhase('idle');
+        isAnimating.current = false;
+        setMobileZoomedOut(true);
+        return;
       }
-      accumulatedHeight += segmentHeight;
+      requestAnimationFrame(animate);
+    };
+    requestAnimationFrame(animate);
+  };
+
+  const performMobileScrollTo = (targetY: number) => {
+    if (isAnimating.current) return;
+
+    isAnimating.current = true;
+    setAnimationPhase('scrolling');
+
+    const startY = scrollState.virtual;
+    let startTime: number | null = null;
+
+    animateScrollFill(targetY);
+
+    const animate = (timestamp: number) => {
+      if (!startTime) startTime = timestamp;
+      const elapsed = timestamp - startTime;
+      const progress = Math.min(1, elapsed / ANIMATION_DURATION.SCROLL);
+      const easedProgress = easeInOutCubic(progress);
+
+      setScrollState((prev) => ({
+        ...prev,
+        virtual: startY + (targetY - startY) * easedProgress,
+      }));
+
+      if (progress === 1) {
+        setScrollState((prev) => ({ ...prev, virtual: targetY }));
+        setAnimationPhase('idle');
+        isAnimating.current = false;
+        return;
+      }
+      requestAnimationFrame(animate);
+    };
+    requestAnimationFrame(animate);
+  };
+
+  const performMobileZoomIn = () => {
+    if (isAnimating.current) return;
+
+    isAnimating.current = true;
+    setAnimationPhase('zoomIn');
+
+    const centerY = getViewportCenter(scrollState.virtual);
+    setZoomState({ level: MOBILE_ZOOM_OUT_SCALE, pivotY: centerY });
+
+    let startTime: number | null = null;
+
+    const animate = (timestamp: number) => {
+      if (!startTime) startTime = timestamp;
+      const elapsed = timestamp - startTime;
+      const progress = Math.min(1, elapsed / ANIMATION_DURATION.ZOOM_IN);
+
+      setZoomState((prev) => ({
+        ...prev,
+        level: MOBILE_ZOOM_OUT_SCALE + (1 - MOBILE_ZOOM_OUT_SCALE) * progress,
+      }));
+
+      if (progress === 1) {
+        setZoomState({ level: 1, pivotY: centerY });
+        setAnimationPhase('idle');
+        isAnimating.current = false;
+        setMobileZoomedOut(false);
+        return;
+      }
+      requestAnimationFrame(animate);
+    };
+    requestAnimationFrame(animate);
+  };
+
+  const handleScrollbarClick = (clickY: number, scrollbarHeight: number) => {
+    if (isMobile && !mobileZoomedOut) return;
+    if (!sectionLayouts.length) return;
+
+    const maxScroll = getMaxScroll();
+    if (maxScroll <= 0) return;
+
+    const scrollbarRatio = Math.max(0, Math.min(1, clickY / scrollbarHeight));
+    const scrollTarget = scrollbarRatio * maxScroll;
+
+    if (isMobile && mobileZoomedOut) {
+      performMobileScrollTo(scrollTarget);
+    } else {
+      let accumulatedHeight = 0;
+      let clickedSection = null;
+      let clickYWithinSection = clickY;
+
+      for (const section of sections) {
+        const segmentHeight = (sectionHeightPercentages[section.id] || 0) * scrollbarHeight / 100;
+        if (clickY >= accumulatedHeight && clickY < accumulatedHeight + segmentHeight) {
+          clickedSection = section;
+          clickYWithinSection = clickY - accumulatedHeight;
+          break;
+        }
+        accumulatedHeight += segmentHeight;
+      }
+
+      if (!clickedSection) return;
+
+      const layout = sectionLayouts.find((s) => s.id === clickedSection.id);
+      if (!layout) return;
+
+      const segmentHeight = (sectionHeightPercentages[clickedSection.id] || 0) * scrollbarHeight / 100;
+      const clickRatio = Math.min(1, Math.max(0, clickYWithinSection / segmentHeight));
+      const targetY = layout.start + clickRatio * layout.height;
+      const finalScrollTarget = targetY - window.innerHeight / 2 - clickRatio * layout.height * 0.1;
+
+      performThreePhaseNavigation(finalScrollTarget);
     }
-
-    if (!clickedSection) return;
-
-    const layout = sectionLayouts.find((s) => s.id === clickedSection.id);
-    if (!layout) return;
-
-    const segmentHeight = (sectionHeightPercentages[clickedSection.id] || 0) * scrollbarHeight / 100;
-    const clickRatio = Math.min(1, Math.max(0, clickYWithinSection / segmentHeight));
-    const targetY = layout.start + clickRatio * layout.height;
-    const scrollTarget = targetY - window.innerHeight / 2 - clickRatio * layout.height * 0.1;
-
-    performThreePhaseNavigation(scrollTarget);
   };
 
   const handleSectionClick = (sectionId: string) => {
@@ -284,18 +397,46 @@ function App() {
     performThreePhaseNavigation(targetY);
   };
 
-  const handleWheel = (e: WheelEvent) => {
-    if (isAnimating.current) return;
-    e.preventDefault();
+  const handleTouchStart = (e: React.TouchEvent) => {
+    if (!isMobile || isAnimating.current) return;
+    touchStartY.current = e.touches[0].clientY;
+    lastTouchY.current = e.touches[0].clientY;
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (!isMobile || isAnimating.current || touchStartY.current === null || lastTouchY.current === null) return;
+    
+    const currentY = e.touches[0].clientY;
+    const deltaY = lastTouchY.current - currentY;
+    lastTouchY.current = currentY;
 
     setScrollState((prev) => {
-      const maxScroll = (contentRef.current?.scrollHeight || 0) - window.innerHeight;
-      const newY = clampScroll(prev.virtual + e.deltaY, maxScroll);
+      const maxScroll = getMaxScroll();
+      const newY = clampScroll(prev.virtual + deltaY * 1.5, maxScroll);
       return { ...prev, virtual: newY };
     });
   };
 
-  // Effects
+  const handleTouchEnd = () => {
+    if (!isMobile) return;
+    touchStartY.current = null;
+    lastTouchY.current = null;
+  };
+
+  const handleHamburgerClick = () => {
+    if (!mobileZoomedOut) {
+      performMobileZoomOut();
+    } else {
+      performMobileZoomIn();
+    }
+  };
+
+  const handleContentClick = () => {
+    if (isMobile && mobileZoomedOut) {
+      performMobileZoomIn();
+    }
+  };
+
   useEffect(() => {
     const updateHeights = () => setSectionHeightPercentages(calculateSectionHeightPercentages());
     updateHeights();
@@ -311,19 +452,23 @@ function App() {
   }, []);
 
   useEffect(() => {
-    window.addEventListener('mousemove', showSidebar);
-    window.addEventListener('wheel', showScrollbar);
+    if (!isMobile) {
+      window.addEventListener('mousemove', showSidebar);
+      window.addEventListener('wheel', showScrollbar);
 
-    return () => {
-      window.removeEventListener('mousemove', showSidebar);
-      window.removeEventListener('wheel', showScrollbar);
-      Object.values(timeouts.current).forEach((id) => id && clearTimeout(id));
-    };
-  }, [animationPhase]);
+      return () => {
+        window.removeEventListener('mousemove', showSidebar);
+        window.removeEventListener('wheel', showScrollbar);
+        Object.values(timeouts.current).forEach((id) => id && clearTimeout(id));
+      };
+    }
+  }, [animationPhase, isMobile]);
 
   useEffect(() => {
-    showScrollbar();
-  }, [scrollState.virtual]);
+    if (!isMobile) {
+      showScrollbar();
+    }
+  }, [scrollState.virtual, isMobile]);
 
   useEffect(() => {
     const { fills, activeId } = calculateScrollProgress(scrollState.virtual);
@@ -338,9 +483,20 @@ function App() {
   }, [scrollState.virtual]);
 
   useEffect(() => {
-    window.addEventListener('wheel', handleWheel, { passive: false });
-    return () => window.removeEventListener('wheel', handleWheel);
-  }, []);
+    const wheelHandler = (e: WheelEvent) => {
+      if (isAnimating.current) return;
+      e.preventDefault();
+
+      setScrollState((prev) => {
+        const maxScroll = getMaxScroll();
+        const newY = clampScroll(prev.virtual + e.deltaY, maxScroll);
+        return { ...prev, virtual: newY };
+      });
+    };
+
+    window.addEventListener('wheel', wheelHandler, { passive: false });
+    return () => window.removeEventListener('wheel', wheelHandler);
+  }, [sectionLayouts]);
 
   const renderSection = (section: typeof sections[0], index: number) => (
     <section
@@ -353,7 +509,7 @@ function App() {
         marginBottom: 0,
       }}
     >
-      <div style={{ maxWidth: '800px', margin: '0 auto', padding: '48px 24px' }}>
+      <div style={{ maxWidth: '800px', margin: '0 auto', padding: '78px 24px' }}>
         <h2 className="text-4xl font-bold mb-8 text-gray-900">{section.title}</h2>
         <div className="space-y-6 text-gray-700 text-lg leading-relaxed">
           {section.content.map((paragraph, pIndex) => (
@@ -429,81 +585,228 @@ function App() {
         zIndex: 0,
       }}
     >
-      {/* Content */}
       <div
         ref={contentRef}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+        onClick={handleContentClick}
         style={{
           position: 'relative',
           width: '100vw',
           height: '100%',
           willChange: 'transform',
-          transform: `translateY(-${scrollState.virtual}px) scale(${zoomState.level})`,
-          transformOrigin: `center ${zoomState.pivotY || getViewportCenter(scrollState.virtual)}px`,
+          transform: isMobile
+            ? `translateY(-${
+                (mobileZoomedOut || animationPhase === 'zoomOut' || animationPhase === 'zoomIn')
+                  ? scrollState.virtual * zoomState.level
+                  : Math.min(scrollState.virtual, getMaxScroll())
+              }px) scale(${zoomState.level})`
+            : `translateY(-${scrollState.virtual}px) scale(${zoomState.level})`,
+          transformOrigin: isMobile 
+            ? 'center top' 
+            : `center ${zoomState.pivotY || getViewportCenter(scrollState.virtual)}px`,
           transition: 'none',
           zIndex: 1,
+          cursor: isMobile && mobileZoomedOut ? 'pointer' : 'default',
         }}
       >
         <main>{sections.map(renderSection)}</main>
       </div>
 
-      {/* Sidebar Navigation */}
-      <nav
-        className={`hidden md:flex h-full flex-col transition-opacity duration-300 ${
-          uiVisibility.sidebar ? 'opacity-100' : 'opacity-0 pointer-events-none'
-        }`}
-        onMouseEnter={() => setUiVisibility((prev) => ({ ...prev, sidebar: true }))}
-        onMouseLeave={() => {
-          if (animationPhase === 'idle') {
-            setUiVisibility((prev) => ({ ...prev, sidebar: false }));
-          }
-        }}
-        style={{
-          position: 'absolute',
-          top: UI_LAYOUT.SIDEBAR_TOP,
-          right: UI_LAYOUT.SIDEBAR_RIGHT,
-          height: `calc(100% - ${UI_LAYOUT.TOTAL_VERTICAL_PADDING}px)`,
-          zIndex: 2,
-          background: 'transparent',
-        }}
-      >
-        <div className="flex flex-col h-full">{sections.map(renderSectionButton)}</div>
-      </nav>
-
-      {/* Current Section Indicator */}
-      <div
-        style={{
-          position: 'absolute',
-          top: UI_LAYOUT.CURRENT_SECTION_TOP,
-          right: UI_LAYOUT.SCROLLBAR_RIGHT,
-          maxWidth: '200px',
-          zIndex: 3,
-        }}
-      >
+      {isMobile && (
         <div
+          className="md:hidden fixed top-0 left-0 right-0 z-50"
           style={{
-            fontSize: '14px',
-            fontWeight: '600',
-            color: '#3b82f6',
-            marginBottom: '12px',
-            whiteSpace: 'nowrap',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
+            background: 'white',
+            boxShadow: '0 2px 8px rgba(0, 0, 0, 0.1)',
+            padding: '12px 16px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
           }}
         >
-          {sections.find((s) => s.id === currentSectionId)?.title || ''}
-        </div>
-      </div>
+          <div style={{ flex: 1, display: 'flex', justifyContent: 'center' }}>
+            <div
+              style={{
+                fontSize: '16px',
+                fontWeight: '600',
+                color: '#1f2937',
+                textAlign: 'center',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                maxWidth: '70%',
+              }}
+            >
+              {sections.find((s) => s.id === currentSectionId)?.title || ''}
+            </div>
+          </div>
 
-      {/* Scrollbar */}
+          <button
+            onClick={handleHamburgerClick}
+            className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
+            style={{
+              width: '40px',
+              height: '40px',
+              display: 'flex',
+              flexDirection: 'column',
+              justifyContent: 'center',
+              alignItems: 'center',
+              gap: '5px',
+              flexShrink: 0,
+            }}
+            aria-label="Menu"
+          >
+            <span
+              style={{
+                width: '24px',
+                height: '2px',
+                backgroundColor: '#1f2937',
+                transition: 'transform 0.3s, opacity 0.3s',
+                transform: mobileZoomedOut ? 'rotate(45deg) translateY(7px)' : 'none',
+              }}
+            />
+            <span
+              style={{
+                width: '24px',
+                height: '2px',
+                backgroundColor: '#1f2937',
+                transition: 'opacity 0.3s',
+                opacity: mobileZoomedOut ? 0 : 1,
+              }}
+            />
+            <span
+              style={{
+                width: '24px',
+                height: '2px',
+                backgroundColor: '#1f2937',
+                transition: 'transform 0.3s, opacity 0.3s',
+                transform: mobileZoomedOut ? 'rotate(-45deg) translateY(-7px)' : 'none',
+              }}
+            />
+          </button>
+        </div>
+      )}
+
+      {isMobile && mobileZoomedOut && sectionLayouts.length > 0 && (
+        <div
+          style={{
+            position: 'fixed',
+            top: '80px',
+            right: '40px',
+            height: 'calc(100vh - 100px)',
+            display: 'flex',
+            flexDirection: 'column',
+            pointerEvents: 'none',
+            zIndex: 11,
+          }}
+        >
+          {sections.map((section) => {
+            const heightPercent = sectionHeightPercentages[section.id] || 0;
+            
+            return (
+              <div
+                key={`label-${section.id}`}
+                style={{
+                  height: `${heightPercent}%`,
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  justifyContent: 'flex-end',
+                  paddingTop: '2px',
+                  paddingRight: '4px',
+                  pointerEvents: 'auto',
+                  cursor: 'pointer',
+                }}
+                onClick={() => {
+                  const layout = sectionLayouts.find((s) => s.id === section.id);
+                  if (layout) {
+                    performMobileScrollTo(layout.start);
+                  }
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: '10px',
+                    fontWeight: '600',
+                    color: '#1f2937',
+                    textAlign: 'right',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {section.title}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {!isMobile && (
+        <nav
+          className={`hidden md:flex h-full flex-col transition-opacity duration-300 ${
+            uiVisibility.sidebar ? 'opacity-100' : 'opacity-0 pointer-events-none'
+          }`}
+          onMouseEnter={() => setUiVisibility((prev) => ({ ...prev, sidebar: true }))}
+          onMouseLeave={() => {
+            if (animationPhase === 'idle') {
+              setUiVisibility((prev) => ({ ...prev, sidebar: false }));
+            }
+          }}
+          style={{
+            position: 'absolute',
+            top: UI_LAYOUT.SIDEBAR_TOP,
+            right: UI_LAYOUT.SIDEBAR_RIGHT,
+            height: `calc(100% - ${UI_LAYOUT.TOTAL_VERTICAL_PADDING}px)`,
+            zIndex: 2,
+            background: 'transparent',
+          }}
+        >
+          <div className="flex flex-col h-full">{sections.map(renderSectionButton)}</div>
+        </nav>
+      )}
+
+      {!isMobile && (
+        <div
+          style={{
+            position: 'absolute',
+            top: UI_LAYOUT.CURRENT_SECTION_TOP,
+            right: UI_LAYOUT.SCROLLBAR_RIGHT,
+            maxWidth: '200px',
+            zIndex: 3,
+          }}
+        >
+          <div
+            style={{
+              fontSize: '14px',
+              fontWeight: '600',
+              color: '#3b82f6',
+              marginBottom: '12px',
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+            }}
+          >
+            {sections.find((s) => s.id === currentSectionId)?.title || ''}
+          </div>
+        </div>
+      )}
+
       <div
-        className={`hidden md:block transition-opacity duration-300 ${
-          uiVisibility.scrollbar || uiVisibility.sidebar ? 'opacity-100' : 'opacity-0 pointer-events-none'
+        className={`transition-opacity duration-300 ${
+          isMobile ? 'block' : 'hidden md:block'
         }`}
         style={{
+          opacity: isMobile 
+            ? (mobileZoomedOut ? 1 : 0)
+            : (uiVisibility.scrollbar || uiVisibility.sidebar ? 1 : 0),
+          pointerEvents: isMobile
+            ? (mobileZoomedOut ? 'auto' : 'none')
+            : (uiVisibility.scrollbar || uiVisibility.sidebar ? 'auto' : 'none'),
           position: 'absolute',
-          top: UI_LAYOUT.SIDEBAR_TOP,
-          right: UI_LAYOUT.SCROLLBAR_RIGHT,
-          height: `calc(100% - ${UI_LAYOUT.TOTAL_VERTICAL_PADDING}px)`,
+          top: isMobile ? '80px' : UI_LAYOUT.SIDEBAR_TOP,
+          right: isMobile ? '16px' : UI_LAYOUT.SCROLLBAR_RIGHT,
+          height: isMobile ? 'calc(100% - 100px)' : `calc(100% - ${UI_LAYOUT.TOTAL_VERTICAL_PADDING}px)`,
           width: `${UI_LAYOUT.SCROLLBAR_WIDTH}px`,
           zIndex: 3,
         }}

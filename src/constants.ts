@@ -15,3 +15,4 @@ export const UI_LAYOUT = {
   SCROLLBAR_WIDTH: 8,
   TOTAL_VERTICAL_PADDING: 140,
 };
+export const MOBILE_ZOOM_OUT_SCALE = 0.40;
